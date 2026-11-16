@@ -1,0 +1,183 @@
+name: Build & Deliver to TestFlight
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Optional Bundle ID override (defaults to vars.IOS_BUNDLE_ID or com.samhastings.iosconnections)"
+        required: false
+        type: string
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-testflight:
+    name: Build iOS Connections & Upload to TestFlight
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      DEFAULT_BUNDLE_ID: "com.samhastings.iosconnections"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate Xcode project with XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Check TestFlight signing configuration
+        id: config
+        env:
+          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+          VAR_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          SECRET_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          VAR_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          BUNDLE_ID="${INPUT_BUNDLE_ID:-${VAR_BUNDLE_ID:-$DEFAULT_BUNDLE_ID}}"
+          APPLE_TEAM_ID="${SECRET_TEAM_ID:-$VAR_TEAM_ID}"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "team_id=$APPLE_TEAM_ID" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$ASC_KEY_ID" && -n "$ASC_ISSUER_ID" && -n "$ASC_PRIVATE_KEY" && -n "$APPLE_TEAM_ID" ]]; then
+            echo "secrets_ready=true" >> "$GITHUB_OUTPUT"
+            echo "App Store Connect credentials detected — will sign & upload to TestFlight."
+          else
+            echo "secrets_ready=false" >> "$GITHUB_OUTPUT"
+            echo "App Store Connect secrets not yet configured — running unsigned Release archive verification."
+          fi
+
+      - name: Prepare App Store Connect & Bundle ID
+        id: asc
+        if: steps.config.outputs.secrets_ready == 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          BUNDLE_ID: ${{ steps.config.outputs.bundle_id }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/asc-venv"
+          "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet PyJWT cryptography requests
+          "$RUNNER_TEMP/asc-venv/bin/python" scripts/asc_prepare.py
+
+      - name: Archive iOS Connections (Release)
+        env:
+          BUNDLE_ID: ${{ steps.config.outputs.bundle_id }}
+          TEAM_ID: ${{ steps.config.outputs.team_id }}
+          ASC_BUILD_NUMBER: ${{ steps.asc.outputs.build_number }}
+        run: |
+          BUILD_NUMBER="${ASC_BUILD_NUMBER:-$GITHUB_RUN_NUMBER}"
+          TEAM_ARG=()
+          if [[ -n "$TEAM_ID" ]]; then
+            TEAM_ARG=("DEVELOPMENT_TEAM=$TEAM_ID")
+          fi
+
+          xcodebuild archive \
+            -project iOSConnections.xcodeproj \
+            -scheme iOSConnections \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/iOSConnections.xcarchive" \
+            "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID" \
+            "CURRENT_PROJECT_VERSION=$BUILD_NUMBER" \
+            "${TEAM_ARG[@]}" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify compiled archive bundle & AppIcon
+        run: |
+          APP_PLIST="$RUNNER_TEMP/iOSConnections.xcarchive/Products/Applications/iOSConnections.app/Info.plist"
+          plutil -p "$APP_PLIST"
+          test -f "$RUNNER_TEMP/iOSConnections.xcarchive/Products/Applications/iOSConnections.app/iOSConnections"
+          echo "✅ Release .xcarchive built and verified!"
+
+      - name: Cloud-Sign & Upload to TestFlight
+        if: steps.config.outputs.secrets_ready == 'true' && steps.asc.outputs.app_ready == 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_PATH: ${{ steps.asc.outputs.key_path }}
+          TEAM_ID: ${{ steps.config.outputs.team_id }}
+          BUILD_NUMBER: ${{ steps.asc.outputs.build_number }}
+          BUNDLE_ID: ${{ steps.config.outputs.bundle_id }}
+        run: |
+          EXPORT_PLIST="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$EXPORT_PLIST" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>upload</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$EXPORT_PLIST"
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/iOSConnections.xcarchive" \
+            -exportOptionsPlist "$EXPORT_PLIST" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            -authenticationKeyPath "$KEY_PATH"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ### 🚀 Uploaded to TestFlight!
+          - **App:** iOS Connections
+          - **Bundle ID:** \`${BUNDLE_ID}\`
+          - **Build Number:** \`${BUILD_NUMBER}\`
+          - **Next Step:** After Apple finishes processing (~2–5 mins), install straight from the **TestFlight** app on your iPhone!
+          SUMMARY
+
+      - name: Print TestFlight Setup Instructions (when secrets are not set yet)
+        if: steps.config.outputs.secrets_ready != 'true'
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ### ✅ iOS Connections Built Successfully! (Ready for TestFlight Secrets)
+
+          The SwiftUI app compiled and archived cleanly on macOS. To deliver it straight to your iPhone via **TestFlight** (with **zero Mac** and **zero `.p12` certificates** needed), add these 4 secrets in **Settings → Secrets and variables → Actions**:
+
+          | Secret Name | Value |
+          | --- | --- |
+          | `APPLE_TEAM_ID` | Your 10-character Apple Developer Team ID |
+          | `ASC_KEY_ID` | App Store Connect API Key ID (Admin role) |
+          | `ASC_ISSUER_ID` | App Store Connect API Issuer ID (UUID) |
+          | `ASC_PRIVATE_KEY` | Contents of `AuthKey_<KEY_ID>.p8` (raw text or base64) |
+
+          *(Optional)* Set repository variable `IOS_BUNDLE_ID` if you want a custom Bundle ID instead of `com.samhastings.iosconnections`.
+          SUMMARY
+
+      - name: Clean up private key
+        if: always()
+        run: rm -rf ~/.appstoreconnect/private_keys

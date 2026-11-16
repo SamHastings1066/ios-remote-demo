@@ -1,0 +1,17 @@
+# Xcode & macOS
+.DS_Store
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcarchive
+
+# Signing & CI temporary artifacts
+private_keys/
+ExportOptions.plist
+.venv/
+__pycache__/
